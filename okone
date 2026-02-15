@@ -1,0 +1,1539 @@
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // --- API 路由处理 ---
+
+    // 1. 访客记录 API
+    if (url.pathname === '/api/visit') {
+      const geo = request.cf || {};
+      const city = geo.city || '未知城市';
+      const country = geo.country || '未知国家';
+      const lat = geo.latitude || '34.0522';
+      const lon = geo.longitude || '-118.2437';
+      
+      try {
+        if (env.KV) {
+          const visits = (await env.KV.get('visits', { type: 'json' })) || [];
+          visits.unshift({ city, country, lat, lon, time: new Date().toISOString() });
+          if (visits.length > 50) visits.pop();
+          await env.KV.put('visits', JSON.stringify(visits));
+        }
+        return new Response(JSON.stringify({ city, country, lat, lon }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (e) {
+        return new Response(JSON.stringify({ city: '本地', country: '开发环境', lat: 0, lon: 0 }), { headers: { 'Content-Type': 'application/json' } });
+      }
+    }
+
+    // 2. AI助手 API (优化配置)
+    if (url.pathname === '/api/ai' && request.method === 'POST') {
+      try {
+        const { message, thinking } = await request.json();
+        if (!message) return new Response(JSON.stringify({ error: '消息不能为空' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+
+        const apiKey = env.OPENROUTER_API_KEY;
+        if (!apiKey) return new Response(JSON.stringify({ error: 'API密钥未配置' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+
+        const systemPrompt = thinking ? 
+          '你是人文社科领域的学术助手，使用深度思考模式分析问题，给出专业、逻辑严密的回答。请务必完整回答，不要中途截断。' :
+          '你是人文社科领域的学术助手，提供准确、简洁的回答。';
+
+        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': request.headers.get('referer') || 'https://academic-guide.pages.dev',
+            'X-Title': '人文社科学术导览'
+          },
+          body: JSON.stringify({
+            model: 'stepfun/step-3.5-flash:free',
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: message }
+            ],
+            temperature: thinking ? 0.7 : 0.9,
+            max_tokens: 4096 
+          })
+        });
+
+        if (!response.ok) throw new Error(`API请求失败: ${response.status}`);
+
+        const data = await response.json();
+        let responseContent = data.choices[0].message.content;
+        if (thinking) responseContent = `🧠 **深度思考模式**\n\n${responseContent}`;
+        
+        return new Response(JSON.stringify({ response: responseContent }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: 'AI服务暂时不可用' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+    }
+
+    // 3. 树洞留言 API
+    if (url.pathname === '/api/messages') {
+      try {
+        const msgs = (await env.KV.get('messages', { type: 'json' })) || [];
+        return new Response(JSON.stringify(msgs), { headers: { 'Content-Type': 'application/json' } });
+      } catch (e) { return new Response('[]', { headers: { 'Content-Type': 'application/json' } }); }
+    }
+
+    if (url.pathname === '/api/post' && request.method === 'POST') {
+      try {
+        const { text } = await request.json();
+        if (!text || text.length > 200) return new Response('内容不合法', { status: 400 });
+        const msgs = (await env.KV.get('messages', { type: 'json' })) || [];
+        msgs.unshift({ text, time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) });
+        if (msgs.length > 30) msgs.pop(); 
+        await env.KV.put('messages', JSON.stringify(msgs));
+        return new Response('OK');
+      } catch (e) { return new Response('Error', { status: 500 }); }
+    }
+
+    // 4. 管理员删除留言 API (新增)
+    if (url.pathname === '/api/admin/clear-messages' && request.method === 'POST') {
+      try {
+        const { password } = await request.json();
+        const adminPassword = env.ADMIN_PASSWORD;
+        
+        if (!adminPassword) {
+          return new Response(JSON.stringify({ error: '服务端未配置管理密码' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+        }
+        
+        if (password === adminPassword) {
+          await env.KV.put('messages', JSON.stringify([]));
+          return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+        } else {
+          return new Response(JSON.stringify({ error: '密码错误' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+        }
+      } catch (e) { 
+        return new Response(JSON.stringify({ error: '操作失败' }), { status: 500, headers: { 'Content-Type': 'application/json' } }); 
+      }
+    }
+
+    // --- 页面渲染逻辑 ---
+    
+    // 完整站点数据
+    const sites = [
+      // 综合学术
+      { name: "中国知网 (CNKI)", url: "https://www.cnki.net", desc: "中国最大最权威的学术资源集成平台。", category: "综合学术", level: "核心数据库" },
+      { name: "万方数据", url: "https://www.wanfangdata.com.cn", desc: "大型综合性学术信息服务平台。", category: "综合学术", level: "核心数据库" },
+      { name: "维普资讯", url: "http://www.cqvip.com", desc: "中文科技期刊资源服务平台。", category: "综合学术", level: "核心数据库" },
+      { name: "国家哲学社会科学文献中心", url: "https://www.ncpssd.org", desc: "国家级公益性社科平台，海量免费期刊。", category: "综合学术", level: "官方平台" },
+      { name: "国家哲学社会科学学术期刊库", url: "https://www.nssd.cn", desc: "精选社科核心期刊全文库。", category: "综合学术", level: "CSSCI" },
+      { name: "Google Scholar", url: "https://scholar.google.com", desc: "全球最大的免费学术搜索引擎。", category: "综合学术", level: "权威索引" },
+      { name: "百度学术", url: "https://xueshu.baidu.com", desc: "国内领先的学术资源搜索平台。", category: "综合学术", level: "搜索引擎" },
+      { name: "JSTOR", url: "https://www.jstor.org", desc: "西文过刊数据库，人文社科核心。", category: "综合学术", level: "SSCI Q1" },
+      { name: "Project MUSE", url: "https://muse.jhu.edu", desc: "权威人文社科期刊数据库。", category: "综合学术", level: "SSCI Q1" },
+      { name: "Web of Science", url: "https://www.webofscience.com", desc: "全球权威引文索引(SSCI/A&HCI)。", category: "综合学术", level: "SCI/SSCI" },
+      { name: "Scopus", url: "https://www.scopus.com", desc: "Elsevier大型文摘数据库。", category: "综合学术", level: "SCI/SSCI" },
+      { name: "ScienceDirect", url: "https://www.sciencedirect.com", desc: "Elsevier核心全文数据库。", category: "综合学术", level: "SCI Q1" },
+      { name: "SpringerLink", url: "https://link.springer.com", desc: "全球领先的STM学术资源平台。", category: "综合学术", level: "SCI Q1" },
+      { name: "Taylor & Francis", url: "https://www.tandfonline.com", desc: "世界领先的人文社科出版社。", category: "综合学术", level: "SSCI Q1" },
+      { name: "SAGE Journals", url: "https://journals.sagepub.com", desc: "国际领先的学术期刊出版商。", category: "综合学术", level: "SSCI" },
+      { name: "Wiley", url: "https://onlinelibrary.wiley.com", desc: "全球历史最悠久的学术出版商。", category: "综合学术", level: "SCI/SSCI" },
+      { name: "ProQuest", url: "https://www.proquest.com", desc: "全球领先的博硕士论文库。", category: "综合学术", level: "学位论文" },
+      { name: "EBSCOhost", url: "https://www.ebsco.com", desc: "提供广泛的学术数据库。", category: "综合学术", level: "综合数据库" },
+      { name: "DOAJ", url: "https://doaj.org", desc: "开放获取期刊目录。", category: "综合学术", level: "开放获取" },
+      { name: "ResearchGate", url: "https://www.researchgate.net", desc: "面向研究学者的社交网络。", category: "综合学术", level: "学术社交" },
+      // 哲学
+      { name: "Stanford Encyclopedia of Philosophy", url: "https://plato.stanford.edu", desc: "斯坦福哲学百科，学界最权威。", category: "哲学", level: "权威百科" },
+      { name: "Internet Encyclopedia of Philosophy", url: "https://www.iep.utm.edu", desc: "免费的学术哲学资源。", category: "哲学", level: "开放获取" },
+      { name: "PhilPapers", url: "https://philpapers.org", desc: "哲学文献索引与研究社区。", category: "哲学", level: "专业索引" },
+      { name: "中国哲学书电子化计划", url: "https://ctext.org", desc: "中国古典文献数字化项目。", category: "哲学", level: "古籍整理" },
+      { name: "马克思主义研究网", url: "http://myy.cass.cn", desc: "中国社科院马克思主义研究院。", category: "哲学", level: "官方机构" },
+      { name: "佛学数位图书馆", url: "https://buddhist.fhl.net", desc: "台大佛学数字图书馆。", category: "哲学", level: "专业数据库" },
+      { name: "道教文化资料库", url: "https://www.taoism.org.hk", desc: "香港道教文化资料库。", category: "哲学", level: "专业资料" },
+      { name: "中国现象学网", url: "http://www.cnphenomenology.com", desc: "现象学研究资讯平台。", category: "哲学", level: "学术社区" },
+      { name: "Ethics Updates", url: "https://ethicsupdates.net", desc: "道德哲学教学与研究资源。", category: "哲学", level: "教学资源" },
+      { name: "Philosophy Documentation Center", url: "https://www.pdcnet.org", desc: "哲学文献中心。", category: "哲学", level: "文献中心" },
+      { name: "中国知网哲学库", url: "https://kns.cnki.net/kns8/defaultresult/index?kw=哲学", desc: "知网哲学学科文献。", category: "哲学", level: "核心期刊" },
+      { name: "Britannica Philosophy", url: "https://www.britannica.com/browse/philosophy", desc: "大英百科全书哲学分类。", category: "哲学", level: "百科全书" },
+      { name: "David Hume Archives", url: "https://davidhume.org", desc: "休谟著作在线档案馆。", category: "哲学", level: "专题档案" },
+      { name: "Marxists Internet Archive", url: "https://www.marxists.org", desc: "马克思主义者互联网档案库。", category: "哲学", level: "开放获取" },
+      { name: "Notre Dame Philosophical Reviews", url: "https://ndpr.nd.edu", desc: "圣母大学哲学评论。", category: "哲学", level: "SSCI" },
+      // 经济学
+      { name: "NBER", url: "https://www.nber.org", desc: "美国国家经济研究局，工作论文权威。", category: "经济学", level: "顶级智库" },
+      { name: "IMF Data", url: "https://www.imf.org/en/Data", desc: "国际货币基金组织数据。", category: "经济学", level: "官方数据" },
+      { name: "World Bank Open Data", url: "https://data.worldbank.org", desc: "世界银行开放数据库。", category: "经济学", level: "官方数据" },
+      { name: "OECD Data", url: "https://data.oecd.org", desc: "经合组织统计数据。", category: "经济学", level: "官方数据" },
+      { name: "EconLit", url: "https://www.aeaweb.org/econlit", desc: "美国经济学会文献库。", category: "经济学", level: "权威索引" },
+      { name: "RePEc", url: "https://repec.org", desc: "经济学研究论文库。", category: "经济学", level: "开放获取" },
+      { name: "JSTOR Economics", url: "https://www.jstor.org/subject/economics", desc: "JSTOR经济学科合集。", category: "经济学", level: "SSCI Q1" },
+      { name: "国研网", url: "http://www.drcnet.com.cn", desc: "国务院发展研究中心信息网。", category: "经济学", level: "官方智库" },
+      { name: "中经网统计数据库", url: "https://db.cei.cn", desc: "国家信息中心经济统计数据。", category: "经济学", level: "核心数据" },
+      { name: "中国经济学教育科研网", url: "http://www.cenet.org.cn", desc: "中国经济学术交流平台。", category: "经济学", level: "学术门户" },
+      { name: "FRED", url: "https://fred.stlouisfed.org", desc: "美联储经济数据库。", category: "经济学", level: "权威数据" },
+      { name: "Wind (万得)", url: "https://www.wind.com.cn", desc: "中国金融数据服务商。", category: "经济学", level: "金融终端" },
+      { name: "CSMAR", url: "https://www.gtarsc.com", desc: "国泰安经济金融研究库。", category: "经济学", level: "研究数据" },
+      { name: "The Economist", url: "https://www.economist.com", desc: "经济学人杂志。", category: "经济学", level: "顶级期刊" },
+      { name: "Financial Times", url: "https://www.ft.com", desc: "金融时报。", category: "经济学", level: "权威媒体" },
+      { name: "国家统计局", url: "http://www.stats.gov.cn", desc: "中国官方统计数据。", category: "经济学", level: "官方数据" },
+      { name: "WTO Statistics", url: "https://stats.wto.org", desc: "世贸组织统计数据库。", category: "经济学", level: "官方数据" },
+      { name: "Bureau of Economic Analysis", url: "https://www.bea.gov", desc: "美国经济分析局。", category: "经济学", level: "官方数据" },
+      { name: "Bureau of Labor Statistics", url: "https://www.bls.gov", desc: "美国劳工统计局。", category: "经济学", level: "官方数据" },
+      { name: "Trading Economics", url: "https://tradingeconomics.com", desc: "全球宏观经济指标。", category: "经济学", level: "数据平台" },
+      // 法学
+      { name: "北大法宝", url: "https://www.pkulaw.com", desc: "中国最大的法律信息检索系统。", category: "法学", level: "核心数据库" },
+      { name: "威科先行", url: "https://law.wkinfo.com.cn", desc: "专业法律检索库。", category: "法学", level: "商业数据库" },
+      { name: "中国裁判文书网", url: "https://wenshu.court.gov.cn", desc: "最高法裁判文书公开平台。", category: "法学", level: "官方平台" },
+      { name: "HeinOnline", url: "https://heinonline.org", desc: "全球最大法学期刊库。", category: "法学", level: "SSCI" },
+      { name: "Westlaw", url: "https://legal.thomsonreuters.com", desc: "汤森路透法律数据库。", category: "法学", level: "顶级数据库" },
+      { name: "LexisNexis", url: "https://www.lexisnexis.com", desc: "全球领先法律信息资源。", category: "法学", level: "顶级数据库" },
+      { name: "中国法学网", url: "https://www.iolaw.org.cn", desc: "中国社科院法学研究所。", category: "法学", level: "官方机构" },
+      { name: "中国宪治网", url: "http://www.calaw.cn", desc: "宪法学研究平台。", category: "法学", level: "学术门户" },
+      { name: "北大法意", url: "https://www.lawyee.org", desc: "北大实证法务研究所。", category: "法学", level: "学术机构" },
+      { name: "Justia", url: "https://law.justia.com", desc: "免费法律信息资源。", category: "法学", level: "开放获取" },
+      { name: "FindLaw", url: "https://caselaw.findlaw.com", desc: "法律案例与信息网站。", category: "法学", level: "信息门户" },
+      { name: "欧洲人权法院", url: "https://www.echr.coe.int", desc: "ECHR官方文书库。", category: "法学", level: "国际法院" },
+      { name: "WTO Law", url: "https://www.wto.org/english/tratop_e/dispu_e/dispu_e.htm", desc: "WTO争端解决文书。", category: "法学", level: "国际法" },
+      { name: "中华人民共和国司法部", url: "http://www.moj.gov.cn", desc: "司法部官网。", category: "法学", level: "政府机构" },
+      { name: "最高人民检察院", url: "https://www.spp.gov.cn", desc: "最高检官网。", category: "法学", level: "政府机构" },
+      // 教育学
+      { name: "ERIC", url: "https://eric.ed.gov", desc: "美国教育部教育学文献库。", category: "教育学", level: "权威索引" },
+      { name: "ProQuest Education Journals", url: "https://www.proquest.com/products-services/Education-Journals.html", desc: "教育期刊数据库。", category: "教育学", level: "核心数据库" },
+      { name: "OECD Education", url: "https://www.oecd.org/education/", desc: "经合组织教育统计。", category: "教育学", level: "官方数据" },
+      { name: "UNESCO Education", url: "https://en.unesco.org/themes/education", desc: "联合国教科文组织。", category: "教育学", level: "国际组织" },
+      { name: "中国教育部", url: "https://www.moe.gov.cn", desc: "中国教育部官网。", category: "教育学", level: "政府机构" },
+      { name: "中国教育在线", url: "https://www.eol.cn", desc: "中国最大教育门户之一。", category: "教育学", level: "信息门户" },
+      { name: "学信网", url: "https://www.chsi.com.cn", desc: "学历查询官方平台。", category: "教育学", level: "官方平台" },
+      { name: "Teachers College Record", url: "https://www.tcrecord.org", desc: "哥伦比亚大学师范学院期刊。", category: "教育学", level: "SSCI" },
+      { name: "Education Week", url: "https://www.edweek.org", desc: "美国教育新闻权威媒体。", category: "教育学", level: "权威媒体" },
+      { name: "中国知网教育库", url: "https://kns.cnki.net/kns8/defaultresult/index?kw=教育", desc: "知网教育学文献。", category: "教育学", level: "核心期刊" },
+      // 文学/语言
+      { name: "MLA International Bibliography", url: "https://www.mla.org/bibliography", desc: "现代语言协会权威索引。", category: "文学/语言", level: "权威索引" },
+      { name: "中国基本古籍库", url: "https://www.ancientbooks.cn", desc: "大型古籍数据库。", category: "文学/语言", level: "古籍整理" },
+      { name: "汉籍电子文献资料库", url: "https://www.ihp.sinica.edu.tw", desc: "台湾中研院古籍库。", category: "文学/语言", level: "古籍整理" },
+      { name: "Project Gutenberg", url: "https://www.gutenberg.org", desc: "古登堡计划，免费电子书库。", category: "文学/语言", level: "开放获取" },
+      { name: "Poetry Foundation", url: "https://www.poetryfoundation.org", desc: "诗歌基金会，海量诗歌赏析。", category: "文学/语言", level: "专业机构" },
+      { name: "Internet Archive", url: "https://archive.org", desc: "互联网档案馆。", category: "文学/语言", level: "数字档案" },
+      { name: "Open Library", url: "https://openlibrary.org", desc: "网页式书籍图书馆。", category: "文学/语言", level: "开放获取" },
+      { name: "中国诗歌网", url: "https://www.zgshige.com", desc: "中国作协诗歌网站。", category: "文学/语言", level: "专业机构" },
+      { name: "语料库在线", url: "http://www.cncorpus.org", desc: "北京大学语料库研究中心。", category: "文学/语言", level: "研究工具" },
+      { name: "BNC", url: "https://www.english-corpora.org/bnc/", desc: "英国国家语料库。", category: "文学/语言", level: "研究工具" },
+      { name: "COCA", url: "https://www.english-corpora.org/coca/", desc: "美国当代英语语料库。", category: "文学/语言", level: "研究工具" },
+      { name: "当代文学研究", url: "http://www.ddwx.cn", desc: "当代文学研究刊物。", category: "文学/语言", level: "核心期刊" },
+      { name: "中国作家网", url: "https://www.chinawriter.com.cn", desc: "中国作家协会官网。", category: "文学/语言", level: "官方机构" },
+      { name: "Shakespeare Online", url: "https://www.shakespeareonline.com", desc: "莎士比亚在线资源。", category: "文学/语言", level: "专题资源" },
+      { name: "剑桥大学图书馆", url: "https://www.lib.cam.ac.uk", desc: "剑桥大学数字特藏。", category: "文学/语言", level: "数字档案" },
+      // 历史学
+      { name: "中华古籍资源库", url: "https://www.nlc.cn/web/zu.shtml", desc: "中国国家图书馆古籍资源。", category: "历史学", level: "国家图书馆" },
+      { name: "中国地方志", url: "https://www.difangzhi.cn", desc: "中国地方志办公室。", category: "历史学", level: "官方机构" },
+      { name: "抗日战争文献平台", url: "https://www.modernhistory.org.cn", desc: "抗战时期珍贵史料。", category: "历史学", level: "专题档案" },
+      { name: "中国历史研究院", url: "https://www.cssn.cn/history", desc: "中国社科院历史研究院。", category: "历史学", level: "官方机构" },
+      { name: "国家博物馆", url: "https://www.chnmuseum.cn", desc: "中国国家博物馆。", category: "历史学", level: "国家博物馆" },
+      { name: "故宫博物院", url: "https://www.dpm.org.cn", desc: "故宫数字文物库。", category: "历史学", level: "国家博物馆" },
+      { name: "HathiTrust", url: "https://www.hathitrust.org", desc: "全球大学图书馆数字库。", category: "历史学", level: "数字图书馆" },
+      { name: "Perseus Digital Library", url: "https://www.perseus.tufts.edu", desc: "古典学数字图书馆。", category: "历史学", level: "数字图书馆" },
+      { name: "World Digital Library", url: "https://www.wdl.org", desc: "世界数字图书馆。", category: "历史学", level: "数字图书馆" },
+      { name: "Europeana", url: "https://www.europeana.eu", desc: "欧洲文化遗产数字平台。", category: "历史学", level: "数字档案" }
+    ];
+
+    // 将站点数据注入HTML模板
+    const htmlContent = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>人文社科学术导览 - 专业版</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    /* ========== 基础样式变量 ========== */
+    :root {
+      --bg-color: #ffffff;
+      --bg-secondary: #f5f5f7;
+      --text-primary: #1d1d1f;
+      --text-secondary: #86868b;
+      --accent-color: #0071e3;
+      --card-bg: #ffffff;
+      --border-color: #d2d2d7;
+      --shadow: 0 4px 12px rgba(0,0,0,0.08);
+      --font-main: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+      --favorite-color: #ff3b30;
+    }
+
+    [data-theme="dark"] {
+      --bg-color: #000000;
+      --bg-secondary: #1c1c1e;
+      --text-primary: #f5f5f7;
+      --text-secondary: #98989d;
+      --accent-color: #0a84ff;
+      --card-bg: #2c2c2e;
+      --border-color: #38383a;
+      --shadow: 0 4px 12px rgba(0,0,0,0.4);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font-main);
+      background-color: var(--bg-secondary);
+      color: var(--text-primary);
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      transition: background 0.3s ease;
+    }
+
+    /* ========== 导航栏样式 ========== */
+    header {
+      background: rgba(255, 255, 255, 0.8);
+      backdrop-filter: saturate(180%) blur(20px);
+      position: sticky;
+      top: 0;
+      z-index: 999;
+      border-bottom: 1px solid var(--border-color);
+    }
+    [data-theme="dark"] header { background: rgba(28, 28, 30, 0.8); }
+
+    .nav-container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 12px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .logo-section {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .logo { font-size: 20px; font-weight: 700; background: linear-gradient(135deg, #1d1d1f, #0071e3); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    [data-theme="dark"] .logo { background: linear-gradient(135deg, #f5f5f7, #0a84ff); -webkit-background-clip: text; }
+
+    /* 顶部AI按钮 */
+    .ai-header-btn {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      background: linear-gradient(135deg, #0071e3, #5856d6);
+      color: white;
+      border: none;
+      border-radius: 20px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s;
+      box-shadow: 0 2px 8px rgba(0,113,227,0.3);
+    }
+    .ai-header-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0,113,227,0.4);
+    }
+
+    /* 右侧工具栏 */
+    .nav-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    /* ========== 时钟组件样式 ========== */
+    .clocks-container {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      padding: 6px 12px;
+      background: var(--bg-secondary);
+      border-radius: 20px;
+    }
+
+    .clock-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      cursor: default;
+    }
+
+    .clock-face {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--card-bg);
+      border: 1px solid var(--border-color);
+      position: relative;
+      box-shadow: inset 0 0 0 1px rgba(0,0,0,0.05);
+    }
+
+    .hand {
+      position: absolute;
+      bottom: 50%;
+      left: 50%;
+      transform-origin: 50% 100%;
+      border-radius: 2px;
+    }
+
+    .hour-hand { width: 2px; height: 7px; background: var(--text-primary); margin-left: -1px; }
+    .minute-hand { width: 1.5px; height: 10px; background: var(--text-secondary); margin-left: -0.75px; }
+    .second-hand { width: 0.5px; height: 12px; background: #ff3b30; margin-left: -0.25px; }
+    .center-dot {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 2px;
+      height: 2px;
+      background: var(--accent-color);
+      border-radius: 50%;
+      z-index: 5;
+    }
+
+    .clock-time {
+      font-size: 9px;
+      color: var(--text-secondary);
+      font-weight: 500;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .clock-label {
+      font-size: 8px;
+      color: var(--text-secondary);
+      opacity: 0.7;
+    }
+
+    /* ========== 主内容区样式 ========== */
+    .hero-section {
+      max-width: 800px;
+      margin: 40px auto 30px;
+      text-align: center;
+      padding: 0 20px;
+    }
+
+    .quote-box {
+      font-size: 18px;
+      color: var(--text-secondary);
+      margin-bottom: 30px;
+      font-style: italic;
+      min-height: 27px; 
+    }
+
+    .super-search {
+      display: flex;
+      background: var(--card-bg);
+      border-radius: 12px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.12);
+      overflow: hidden;
+      border: 1px solid var(--border-color);
+      transition: box-shadow 0.3s;
+    }
+    .super-search:focus-within {
+      box-shadow: 0 8px 30px rgba(0,113,227,0.2);
+      border-color: var(--accent-color);
+    }
+
+    .search-select {
+      padding: 0 16px;
+      border: none;
+      background: transparent;
+      color: var(--text-primary);
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+      outline: none;
+      border-right: 1px solid var(--border-color);
+    }
+
+    .search-input-main {
+      flex: 1;
+      padding: 18px 20px;
+      border: none;
+      background: transparent;
+      font-size: 16px;
+      color: var(--text-primary);
+      outline: none;
+    }
+
+    .search-btn {
+      padding: 0 24px;
+      background: var(--accent-color);
+      color: white;
+      border: none;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 15px;
+      transition: opacity 0.2s;
+    }
+    .search-btn:hover { opacity: 0.9; }
+
+    /* ========== 标签栏样式 ========== */
+    .tabs-container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px 24px 0;
+      display: flex;
+      overflow-x: auto;
+      gap: 10px;
+    }
+    .tab-btn {
+      padding: 8px 16px;
+      background: var(--bg-color);
+      border: 1px solid var(--border-color);
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-primary);
+      white-space: nowrap;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .tab-btn.active { background: var(--text-primary); color: var(--bg-color); border-color: transparent; }
+
+    /* ========== 网格布局 ========== */
+    main {
+      max-width: 1200px;
+      margin: 30px auto 60px;
+      padding: 0 24px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    
+    /* ========== 卡片样式 ========== */
+    .card {
+      background: var(--card-bg);
+      border-radius: 12px;
+      padding: 16px;
+      border: 1px solid transparent;
+      box-shadow: var(--shadow);
+      text-decoration: none;
+      color: inherit;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      transition: transform 0.2s;
+    }
+    .card:hover { transform: translateY(-3px); border-color: var(--accent-color); }
+    
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 6px;
+    }
+    
+    .card-title { font-size: 15px; font-weight: 600; line-height: 1.3; flex: 1; }
+    
+    .card-fav-btn {
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 4px;
+      margin-left: 8px;
+      margin-top: -2px;
+      transition: transform 0.2s;
+    }
+    .card-fav-btn svg { width: 18px; height: 18px; stroke: var(--text-secondary); fill: none; stroke-width: 2; }
+    .card-fav-btn.active svg { fill: var(--favorite-color); stroke: var(--favorite-color); }
+    .card-fav-btn:hover { transform: scale(1.2); }
+
+    .card-level {
+      display: inline-block;
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(0, 113, 227, 0.1);
+      color: var(--accent-color);
+      margin-bottom: 8px;
+      font-weight: 600;
+    }
+
+    .card-desc { font-size: 12px; color: var(--text-secondary); flex: 1; margin-bottom: 8px; }
+    .card-tag { font-size: 10px; color: var(--accent-color); opacity: 0.7; display: block; }
+
+    /* ========== 悬浮按钮 ========== */
+    .float-actions {
+      position: fixed;
+      bottom: 100px;
+      right: 30px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 1000;
+    }
+
+    .float-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 16px;
+      background: var(--card-bg);
+      border: 1px solid var(--border-color);
+      border-radius: 24px;
+      color: var(--text-primary);
+      font-size: 13px;
+      font-weight: 500;
+      box-shadow: var(--shadow);
+      cursor: pointer;
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+    .float-btn:hover { 
+      transform: translateY(-2px); 
+      box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+    }
+    .float-btn svg {
+      width: 18px;
+      height: 18px;
+      flex-shrink: 0;
+    }
+
+    .ai-btn {
+      background: linear-gradient(135deg, #0071e3, #5856d6);
+      color: white;
+      border: none;
+    }
+
+    /* ========== 面板样式 ========== */
+    .panel-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.3);
+      z-index: 1001;
+      display: none;
+      justify-content: flex-end;
+    }
+    .panel-overlay.active { display: flex; }
+
+    .side-panel {
+      width: 400px;
+      height: 100%;
+      background: var(--bg-color);
+      box-shadow: -4px 0 20px rgba(0,0,0,0.1);
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      transform: translateX(100%);
+      transition: transform 0.3s ease;
+    }
+    .panel-overlay.active .side-panel { transform: translateX(0); }
+
+    .panel-header {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 20px;
+    }
+    .panel-title { font-size: 18px; font-weight: 700; }
+
+    /* ========== AI聊天面板样式 ========== */
+    .ai-chat-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .ai-chat-box {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 0 4px 16px 0;
+      max-height: calc(100vh - 280px);
+      scrollbar-width: thin;
+      scrollbar-color: var(--border-color) transparent;
+    }
+    
+    .ai-chat-box::-webkit-scrollbar { width: 6px; }
+    .ai-chat-box::-webkit-scrollbar-track { background: transparent; }
+    .ai-chat-box::-webkit-scrollbar-thumb {
+      background-color: var(--border-color);
+      border-radius: 3px;
+    }
+
+    /* 思考模式开关与管理按钮区域 */
+    .thinking-mode {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 12px;
+      background: var(--bg-secondary);
+      border-radius: 8px;
+      margin-bottom: 12px;
+      font-size: 13px;
+    }
+    
+    .chat-controls {
+        display: flex;
+        gap: 8px;
+    }
+    
+    .control-btn {
+        background: none;
+        border: 1px solid var(--border-color);
+        border-radius: 4px;
+        padding: 2px 8px;
+        font-size: 12px;
+        color: var(--text-secondary);
+        cursor: pointer;
+        transition: all 0.2s;
+    }
+    .control-btn:hover {
+        border-color: var(--accent-color);
+        color: var(--accent-color);
+    }
+    .control-btn.danger:hover {
+        border-color: var(--favorite-color);
+        color: var(--favorite-color);
+    }
+
+    .thinking-toggle {
+      position: relative;
+      width: 44px;
+      height: 24px;
+      background: var(--border-color);
+      border-radius: 12px;
+      cursor: pointer;
+      transition: background 0.3s;
+    }
+    
+    .thinking-toggle.active { background: var(--accent-color); }
+
+    .thinking-toggle::after {
+      content: '';
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 20px;
+      height: 20px;
+      background: white;
+      border-radius: 50%;
+      transition: transform 0.3s;
+    }
+    
+    .thinking-toggle.active::after { transform: translateX(20px); }
+
+    .thinking-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* ========== 消息样式 ========== */
+    .msg-item {
+      background: var(--bg-secondary);
+      padding: 10px 14px;
+      border-radius: 12px;
+      font-size: 13px;
+      line-height: 1.5;
+      word-wrap: break-word;
+      white-space: pre-wrap;
+      position: relative;
+    }
+    
+    /* 删除单条消息按钮 */
+    .msg-delete-btn {
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        background: rgba(0,0,0,0.1);
+        border: none;
+        border-radius: 50%;
+        width: 18px;
+        height: 18px;
+        font-size: 12px;
+        line-height: 18px;
+        text-align: center;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 0.2s;
+        color: var(--text-secondary);
+    }
+    
+    .msg-item:hover .msg-delete-btn {
+        opacity: 1;
+    }
+    
+    .msg-time { 
+      font-size: 10px; 
+      color: var(--text-secondary); 
+      margin-top: 4px; 
+      text-align: right; 
+    }
+    
+    .ai-msg {
+      background: linear-gradient(135deg, rgba(0, 113, 227, 0.1), rgba(88, 86, 214, 0.1));
+      border: 1px solid rgba(0, 113, 227, 0.2);
+    }
+
+    .loading-msg {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text-secondary);
+    }
+
+    .loading-dots {
+      display: flex;
+      gap: 4px;
+    }
+
+    .loading-dots span {
+      width: 6px;
+      height: 6px;
+      background: var(--accent-color);
+      border-radius: 50%;
+      animation: bounce 1.4s infinite ease-in-out;
+    }
+
+    .loading-dots span:nth-child(1) { animation-delay: -0.32s; }
+    .loading-dots span:nth-child(2) { animation-delay: -0.16s; }
+
+    @keyframes bounce {
+      0%, 80%, 100% { transform: scale(0); }
+      40% { transform: scale(1); }
+    }
+
+    /* ========== 输入区域 ========== */
+    .chat-input-area {
+      display: flex;
+      gap: 8px;
+      margin-top: auto;
+      padding-top: 12px;
+      border-top: 1px solid var(--border-color);
+    }
+    
+    .chat-input {
+      flex: 1;
+      padding: 10px 12px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      background: var(--bg-secondary);
+      color: var(--text-primary);
+      outline: none;
+      font-size: 14px;
+      resize: none;
+      min-height: 40px;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+    
+    .send-btn {
+      padding: 0 16px;
+      background: var(--accent-color);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 500;
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: opacity 0.2s;
+    }
+    
+    .send-btn:hover { opacity: 0.9; }
+    .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* ========== 地图样式 ========== */
+    #map { height: 300px; width: 100%; border-radius: 12px; margin-bottom: 20px; z-index: 1; }
+    .visitor-list { flex: 1; overflow-y: auto; font-size: 13px; }
+    .visitor-item { padding: 8px 0; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; }
+
+    /* ========== 密码弹窗样式 ========== */
+    .modal-overlay {
+        position: fixed;
+        top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(0,0,0,0.5);
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        z-index: 2000;
+    }
+    .modal-box {
+        background: var(--bg-color);
+        padding: 24px;
+        border-radius: 12px;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+        width: 300px;
+        text-align: center;
+    }
+    .modal-input {
+        width: 100%;
+        padding: 10px;
+        margin: 16px 0;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        background: var(--bg-secondary);
+        color: var(--text-primary);
+    }
+    .modal-btns {
+        display: flex;
+        gap: 12px;
+        justify-content: center;
+    }
+
+    /* ========== 响应式设计 ========== */
+    @media (max-width: 900px) {
+      .clocks-container { display: none; }
+    }
+
+    @media (max-width: 768px) {
+      .hero-section { margin-top: 30px; }
+      .super-search { flex-direction: column; }
+      .search-select { width: 100%; padding: 12px 16px; border-right: none; border-bottom: 1px solid var(--border-color); }
+      .side-panel { width: 100%; }
+      .float-actions { right: 16px; bottom: 20px; }
+      .float-btn { padding: 8px 12px; font-size: 12px; }
+      .ai-header-btn { font-size: 13px; padding: 6px 12px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ========== 页面头部 ========== -->
+<header>
+  <div class="nav-container">
+    <div class="logo-section">
+      <div class="logo">学术导览.恩师钱谦益</div>
+      <button class="ai-header-btn" id="openAIBtn">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        AI助手
+      </button>
+    </div>
+    
+    <div class="nav-right">
+      <!-- 时钟组件 -->
+      <div class="clocks-container">
+        <div class="clock-item">
+          <div class="clock-face" id="clock-beijing"><div class="hand hour-hand"></div><div class="hand minute-hand"></div><div class="hand second-hand"></div><div class="center-dot"></div></div>
+          <div class="clock-time" id="time-beijing">00:00</div>
+          <div class="clock-label">北京</div>
+        </div>
+        <div class="clock-item">
+          <div class="clock-face" id="clock-london"><div class="hand hour-hand"></div><div class="hand minute-hand"></div><div class="hand second-hand"></div><div class="center-dot"></div></div>
+          <div class="clock-time" id="time-london">00:00</div>
+          <div class="clock-label">伦敦</div>
+        </div>
+        <div class="clock-item">
+          <div class="clock-face" id="clock-newyork"><div class="hand hour-hand"></div><div class="hand minute-hand"></div><div class="hand second-hand"></div><div class="center-dot"></div></div>
+          <div class="clock-time" id="time-newyork">00:00</div>
+          <div class="clock-label">纽约</div>
+        </div>
+        <div class="clock-item">
+          <div class="clock-face" id="clock-tokyo"><div class="hand hour-hand"></div><div class="hand minute-hand"></div><div class="hand second-hand"></div><div class="center-dot"></div></div>
+          <div class="clock-time" id="time-tokyo">00:00</div>
+          <div class="clock-label">东京</div>
+        </div>
+        <div class="clock-item">
+          <div class="clock-face" id="clock-paris"><div class="hand hour-hand"></div><div class="hand minute-hand"></div><div class="hand second-hand"></div><div class="center-dot"></div></div>
+          <div class="clock-time" id="time-paris">00:00</div>
+          <div class="clock-label">巴黎</div>
+        </div>
+        <div class="clock-item">
+          <div class="clock-face" id="clock-sydney"><div class="hand hour-hand"></div><div class="hand minute-hand"></div><div class="hand second-hand"></div><div class="center-dot"></div></div>
+          <div class="clock-time" id="time-sydney">00:00</div>
+          <div class="clock-label">悉尼</div>
+        </div>
+      </div>
+
+      <button class="icon-btn" id="themeToggle" style="background:none; border:none; cursor:pointer; color:var(--text-primary); padding:8px;">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<!-- ========== 主内容区 ========== -->
+<div class="hero-section">
+  <div class="quote-box" id="quoteBox">"读书不是为了雄辩和驳斥，也不是为了轻信和盲从，而是为了思考和权衡。"</div>
+  
+  <div class="super-search">
+    <select class="search-select" id="engineSelect">
+      <option value="cnki">📚 知网搜索</option>
+      <option value="baidu">📕 百度学术</option>
+      <option value="google">🌐 谷歌学术</option>
+      <option value="site">🔍 本站搜索</option>
+    </select>
+    <input type="text" class="search-input-main" id="mainSearchInput" placeholder="输入关键词，回车搜索...">
+    <button class="search-btn" id="searchBtn">搜索</button>
+  </div>
+</div>
+
+<!-- ========== 分类标签 ========== -->
+<div class="tabs-container">
+  <button class="tab-btn active" data-filter="总览">总览</button>
+  <button class="tab-btn" data-filter="收藏">⭐ 我的收藏</button>
+  <button class="tab-btn" data-filter="综合学术">综合学术</button>
+  <button class="tab-btn" data-filter="哲学">哲学</button>
+  <button class="tab-btn" data-filter="经济学">经济学</button>
+  <button class="tab-btn" data-filter="法学">法学</button>
+  <button class="tab-btn" data-filter="教育学">教育学</button>
+  <button class="tab-btn" data-filter="文学/语言">文学/语言</button>
+  <button class="tab-btn" data-filter="历史学">历史学</button>
+</div>
+
+<!-- ========== 主网格 ========== -->
+<main>
+  <div class="grid" id="grid"></div>
+</main>
+
+<!-- ========== 悬浮按钮 ========== -->
+<div class="float-actions">
+  <button class="float-btn ai-btn" id="openAIFloatBtn">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+    AI助手
+  </button>
+  <button class="float-btn" id="openMapBtn">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+    访客地图
+  </button>
+  <button class="float-btn" id="openHoleBtn">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+    学术树洞
+  </button>
+</div>
+
+<!-- ========== 侧边面板 ========== -->
+<div class="panel-overlay" id="panelOverlay">
+  <div class="side-panel">
+    <div class="panel-header">
+      <div class="panel-title" id="panelTitle">面板标题</div>
+      <button class="close-btn" id="closePanel" style="background:none; border:none; font-size:24px; cursor:pointer; color:var(--text-secondary);">&times;</button>
+    </div>
+    <div id="panelContent"></div>
+  </div>
+</div>
+
+<!-- ========== 密码弹窗 (新增) ========== -->
+<div class="modal-overlay" id="passwordModal" style="display: none;">
+  <div class="modal-box">
+    <h3 style="margin-bottom: 8px;">管理员验证</h3>
+    <p style="font-size: 13px; color: var(--text-secondary);">请输入管理员密码以执行操作</p>
+    <input type="password" id="adminPasswordInput" class="modal-input" placeholder="请输入密码">
+    <div class="modal-btns">
+      <button class="control-btn" onclick="window.closePasswordModal()">取消</button>
+      <button class="control-btn" style="background: var(--accent-color); color: white; border: none;" onclick="window.submitPassword()">确认</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+  // ==================== 数据配置 ====================
+  const sites = ${JSON.stringify(sites)};
+  
+  // ==================== 工具函数模块 ====================
+  const Utils = {
+    storage: {
+      get(key, defaultValue = null) {
+        try {
+          const item = localStorage.getItem(key);
+          return item ? JSON.parse(item) : defaultValue;
+        } catch(e) { return defaultValue; }
+      },
+      set(key, value) {
+        try { localStorage.setItem(key, JSON.stringify(value)); return true; } 
+        catch(e) { return false; }
+      }
+    }
+  };
+
+  // ==================== 收藏功能模块 ====================
+  const FavoriteManager = {
+    KEY: 'academic_favorites',
+    getAll() { return Utils.storage.get(this.KEY, []); },
+    save(list) { Utils.storage.set(this.KEY, list); },
+    toggle(name) {
+      const favorites = this.getAll();
+      const index = favorites.indexOf(name);
+      if (index > -1) { favorites.splice(index, 1); } else { favorites.push(name); }
+      this.save(favorites);
+      return favorites;
+    },
+    has(name) { return this.getAll().includes(name); }
+  };
+
+  // ==================== AI对话管理模块 (新增删除功能) ====================
+  const AIChatManager = {
+    KEY: 'ai_chat_history',
+    MAX_HISTORY: 100,
+    getHistory() { return Utils.storage.get(this.KEY, []); },
+    saveHistory(history) {
+      if (history.length > this.MAX_HISTORY) { history = history.slice(-this.MAX_HISTORY); }
+      Utils.storage.set(this.KEY, history);
+    },
+    addMessage(message) {
+      const history = this.getHistory();
+      history.push({ ...message, timestamp: Date.now() });
+      this.saveHistory(history);
+      return history;
+    },
+    deleteMessage(index) {
+        let history = this.getHistory();
+        history = history.slice(0, index);
+        this.saveHistory(history);
+        return history;
+    },
+    clearHistory() { Utils.storage.set(this.KEY, []); }
+  };
+
+  // ==================== 时钟系统模块 ====================
+  const ClockSystem = {
+    clocks: [
+      { id: 'beijing', offset: 8, element: 'clock-beijing', timeEl: 'time-beijing' },
+      { id: 'london', offset: 0, element: 'clock-london', timeEl: 'time-london' },
+      { id: 'newyork', offset: -5, element: 'clock-newyork', timeEl: 'time-newyork' },
+      { id: 'tokyo', offset: 9, element: 'clock-tokyo', timeEl: 'time-tokyo' },
+      { id: 'paris', offset: 1, element: 'clock-paris', timeEl: 'time-paris' },
+      { id: 'sydney', offset: 11, element: 'clock-sydney', timeEl: 'time-sydney' }
+    ],
+    init() {
+      this.update();
+      setInterval(() => this.update(), 1000);
+    },
+    update() {
+      const now = new Date();
+      const seconds = now.getUTCSeconds();
+      const minutes = now.getUTCMinutes();
+      const hours = now.getUTCHours();
+      this.clocks.forEach(clock => {
+        const el = document.getElementById(clock.element);
+        const timeEl = document.getElementById(clock.timeEl);
+        if (!el || !timeEl) return;
+        const localHours = (hours + clock.offset + 24) % 24;
+        const secDeg = (seconds / 60) * 360;
+        const minDeg = ((minutes + seconds / 60) / 60) * 360;
+        const hourDeg = ((localHours % 12 + minutes / 60) / 12) * 360;
+        el.querySelector('.second-hand').style.transform = \`rotate(\${secDeg}deg)\`;
+        el.querySelector('.minute-hand').style.transform = \`rotate(\${minDeg}deg)\`;
+        el.querySelector('.hour-hand').style.transform = \`rotate(\${hourDeg}deg)\`;
+        const timeStr = \`\${String(localHours).padStart(2, '0')}:\${String(minutes).padStart(2, '0')}:\${String(seconds).padStart(2, '0')}\`;
+        timeEl.textContent = timeStr;
+      });
+    }
+  };
+
+  // ==================== 站点渲染模块 ====================
+  const SiteRenderer = {
+    currentData: [], gridElement: null,
+    init() {
+      this.gridElement = document.getElementById('grid');
+      this.render(sites);
+    },
+    render(data) {
+      this.currentData = data;
+      this.gridElement.innerHTML = '';
+      if (data.length === 0) {
+        this.gridElement.innerHTML = '<div style="grid-column: 1/-1; text-align:center; padding:40px; color:var(--text-secondary);">无匹配结果</div>';
+        return;
+      }
+      data.forEach(site => this.renderCard(site));
+    },
+    renderCard(site) {
+      const isFav = FavoriteManager.has(site.name);
+      const card = document.createElement('a');
+      card.className = 'card';
+      card.href = site.url;
+      card.target = '_blank';
+      card.innerHTML = \`
+        <div class="card-header">
+          <div class="card-title">\${site.name}</div>
+          <button class="card-fav-btn \${isFav ? 'active' : ''}" onclick="event.preventDefault(); event.stopPropagation(); SiteRenderer.toggleFav('\${site.name}')" title="收藏">
+            <svg viewBox="0 0 24 24"><polygon points="12,2 15.09,8.26 22,9.27 17,14.14 18.18,21.02 12,17.77 5.82,21.02 7,14.14 2,9.27 8.91,8.26"/></svg>
+          </button>
+        </div>
+        <div class="card-level">\${site.level || '学术资源'}</div>
+        <div class="card-desc">\${site.desc}</div>
+        <span class="card-tag">\${site.category}</span>
+      \`;
+      this.gridElement.appendChild(card);
+    },
+    toggleFav(name) {
+      FavoriteManager.toggle(name);
+      this.render(this.currentData);
+    }
+  };
+
+  // ==================== 搜索功能模块 ====================
+  const SearchEngine = {
+    init() {
+      const input = document.getElementById('mainSearchInput');
+      const btn = document.getElementById('searchBtn');
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') this.search(); });
+      btn.addEventListener('click', () => this.search());
+    },
+    search() {
+      const query = document.getElementById('mainSearchInput').value.trim();
+      const engine = document.getElementById('engineSelect').value;
+      if (!query) return;
+      const urls = {
+        cnki: 'https://kns.cnki.net/kns8/defaultresult/index?kw=' + encodeURIComponent(query),
+        google: 'https://scholar.google.com/scholar?q=' + encodeURIComponent(query),
+        baidu: 'https://xueshu.baidu.com/s?wd=' + encodeURIComponent(query)
+      };
+      if (engine === 'site') { this.searchSite(query); } 
+      else if (urls[engine]) { window.open(urls[engine], '_blank'); }
+    },
+    searchSite(query) {
+      const activeFilter = document.querySelector('.tab-btn.active').dataset.filter;
+      let baseData = [];
+      if (activeFilter === '收藏') {
+        const f = FavoriteManager.getAll();
+        baseData = sites.filter(s => f.includes(s.name));
+      } else if (activeFilter !== '总览') {
+        baseData = sites.filter(s => s.category === activeFilter);
+      } else { baseData = sites; }
+      const filtered = baseData.filter(s => s.name.includes(query) || s.desc.includes(query));
+      SiteRenderer.render(filtered);
+    }
+  };
+
+  // ==================== 分类标签模块 ====================
+  const TabFilter = {
+    init() {
+      document.querySelectorAll('.tab-btn').forEach(tab => {
+        tab.addEventListener('click', () => this.handleTabClick(tab));
+      });
+    },
+    handleTabClick(tab) {
+      document.querySelectorAll('.tab-btn').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      const filter = tab.dataset.filter;
+      let data = [];
+      if (filter === '总览') { data = sites; } 
+      else if (filter === '收藏') {
+        const favorites = FavoriteManager.getAll();
+        data = sites.filter(s => favorites.includes(s.name));
+      } else { data = sites.filter(s => s.category === filter); }
+      SiteRenderer.render(data);
+    }
+  };
+
+  // ==================== 面板管理模块 ====================
+  const PanelManager = {
+    overlay: null, titleEl: null, contentEl: null,
+    init() {
+      this.overlay = document.getElementById('panelOverlay');
+      this.titleEl = document.getElementById('panelTitle');
+      this.contentEl = document.getElementById('panelContent');
+      document.getElementById('closePanel').addEventListener('click', () => this.close());
+      this.overlay.addEventListener('click', (e) => { if (e.target === this.overlay) this.close(); });
+    },
+    open(title, content) {
+      this.titleEl.innerText = title;
+      this.contentEl.innerHTML = content;
+      this.overlay.classList.add('active');
+    },
+    close() { this.overlay.classList.remove('active'); }
+  };
+
+  // ==================== AI助手模块 (优化UI与交互) ====================
+  const AIAssistant = {
+    thinkingMode: false,
+    init() {
+      document.getElementById('openAIBtn').addEventListener('click', () => this.openPanel());
+      document.getElementById('openAIFloatBtn').addEventListener('click', () => this.openPanel());
+    },
+    
+    openPanel() {
+      const history = AIChatManager.getHistory();
+      PanelManager.open("AI学术助手 🤖", \`
+        <div class="ai-chat-panel">
+          <div class="thinking-mode">
+            <div class="thinking-label">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+              <span>深度思考</span>
+              <div class="thinking-toggle" id="thinkingToggle"></div>
+            </div>
+            <div class="chat-controls">
+                <button class="control-btn danger" id="clearChatBtn">清空对话</button>
+            </div>
+          </div>
+          <div class="ai-chat-box" id="aiChatBox"></div>
+          <div class="chat-input-area">
+            <textarea class="chat-input" id="aiInput" placeholder="输入你的学术问题... (支持多行输入)" rows="1"></textarea>
+            <button class="send-btn" id="aiSendBtn">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+            </button>
+          </div>
+        </div>
+      \`);
+      this.initPanelEvents();
+      this.loadHistory(history);
+    },
+
+    initPanelEvents() {
+      const toggle = document.getElementById('thinkingToggle');
+      toggle.addEventListener('click', () => {
+        this.thinkingMode = !this.thinkingMode;
+        toggle.classList.toggle('active', this.thinkingMode);
+      });
+
+      document.getElementById('clearChatBtn').addEventListener('click', () => {
+          if(confirm('确定要清空所有AI对话记录吗？此操作不可恢复。')) {
+              AIChatManager.clearHistory();
+              this.loadHistory([]);
+          }
+      });
+
+      const input = document.getElementById('aiInput');
+      input.addEventListener('input', function() {
+        this.style.height = 'auto';
+        this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+      });
+      document.getElementById('aiSendBtn').onclick = () => this.sendMessage();
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); this.sendMessage(); }
+      });
+      setTimeout(() => input.focus(), 100);
+    },
+
+    loadHistory(history) {
+      const chatBox = document.getElementById('aiChatBox');
+      if (history.length === 0) {
+        chatBox.innerHTML = \`
+          <div class="msg-item ai-msg">
+            <div>👋 你好！我是Step 3.5 Flash AI助手，专门帮助解答人文社科领域的学术问题。</div>
+            <div style="margin-top:8px; font-size:12px; color:var(--text-secondary);">💡 开启“深度思考模式”可获得更详细的分析。<br>🗑️ 悬停在消息上可显示删除按钮。</div>
+          </div>\`;
+        return;
+      }
+      chatBox.innerHTML = '';
+      history.forEach((msg, index) => {
+        const deleteBtn = \`<button class="msg-delete-btn" onclick="AIAssistant.deleteMsg(\${index})">×</button>\`;
+        if (msg.role === 'user') {
+          chatBox.innerHTML += \`<div class="msg-item"><div>\${msg.content}</div>\${deleteBtn}</div>\`;
+        } else {
+          chatBox.innerHTML += \`<div class="msg-item ai-msg"><div>\${msg.content}</div>\${deleteBtn}</div>\`;
+        }
+      });
+      chatBox.scrollTop = chatBox.scrollHeight;
+    },
+    
+    deleteMsg(index) {
+        const newHistory = AIChatManager.deleteMessage(index);
+        this.loadHistory(newHistory);
+    },
+
+    async sendMessage() {
+      const input = document.getElementById('aiInput');
+      const message = input.value.trim();
+      if (!message) return;
+      const chatBox = document.getElementById('aiChatBox');
+      const sendBtn = document.getElementById('aiSendBtn');
+      sendBtn.disabled = true;
+      
+      chatBox.innerHTML += \`<div class="msg-item"><div>\${message}</div></div>\`;
+      AIChatManager.addMessage({ role: 'user', content: message });
+      input.value = '';
+      input.style.height = 'auto';
+      
+      const loadingDiv = document.createElement('div');
+      loadingDiv.className = 'msg-item loading-msg';
+      loadingDiv.innerHTML = \`<div class="loading-dots"><span></span><span></span><span></span></div><span>\${this.thinkingMode ? '深度思考中...' : '思考中...'}</span>\`;
+      chatBox.appendChild(loadingDiv);
+      chatBox.scrollTop = chatBox.scrollHeight;
+
+      try {
+        const res = await fetch('/api/ai', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: message, thinking: this.thinkingMode })
+        });
+        const data = await res.json();
+        chatBox.removeChild(loadingDiv);
+        
+        if (data.error) {
+          chatBox.innerHTML += \`<div class="msg-item" style="color:#ff3b30"><div>❌ \${data.error}</div></div>\`;
+        } else {
+          chatBox.innerHTML += \`<div class="msg-item ai-msg"><div>\${data.response}</div></div>\`;
+          AIChatManager.addMessage({ role: 'assistant', content: data.response });
+        }
+        chatBox.scrollTop = chatBox.scrollHeight;
+        
+      } catch (e) {
+        chatBox.removeChild(loadingDiv);
+        chatBox.innerHTML += \`<div class="msg-item" style="color:#ff3b30"><div>❌ 网络错误，请稍后再试</div></div>\`;
+      } finally {
+        sendBtn.disabled = false;
+        input.focus();
+      }
+    }
+  };
+
+  // ==================== 其他功能模块 (新增密码管理) ====================
+  const OtherFeatures = {
+    passwordCallback: null,
+    
+    init() {
+      this.initQuote();
+      this.initTheme();
+      this.initTreeHole();
+      this.initMap();
+    },
+    
+    initQuote() {
+      const quotes = [
+        "读书不是为了雄辩和驳斥，也不是为了轻信和盲从，而是为了思考和权衡。 —— 培根",
+        "教育不是注满一桶水，而是点燃一把火。 —— 叶芝",
+        "历史是一面镜子，也是一本深刻的教科书。 —— 郭沫若",
+        "哲学是思考的显微镜，透过它我们可以看到事物的本质。 —— 柏拉图",
+        "法律是人类为了共同利益，由人类智慧遵循人类经验所作出的最后成果。 —— 庞德"
+      ];
+      document.getElementById('quoteBox').innerText = '"' + quotes[Math.floor(Math.random() * quotes.length)];
+    },
+    initTheme() {
+      document.getElementById('themeToggle').addEventListener('click', () => {
+        document.body.dataset.theme = document.body.dataset.theme === 'dark' ? '' : 'dark';
+      });
+    },
+    
+    async initTreeHole() {
+      document.getElementById('openHoleBtn').addEventListener('click', async () => {
+        PanelManager.open("学术树洞 🕳️", '<div class="ai-chat-box" id="msgList"><div style="text-align:center;color:var(--text-secondary)">加载中...</div></div><div class="chat-input-area"><input type="text" class="chat-input" id="msgInput" placeholder="说点什么..."><button class="send-btn" id="sendBtn">发 送</button></div><div style="text-align:right; margin-top:10px;"><button class="control-btn danger" id="adminClearBtn">🗑️ 管理员清空</button></div>');
+        
+        try {
+          const res = await fetch('/api/messages');
+          const msgs = await res.json();
+          const list = document.getElementById('msgList');
+          list.innerHTML = '';
+          msgs.forEach(m => { list.innerHTML += \`<div class="msg-item"><div>\${m.text}</div><div class="msg-time">\${m.time}</div></div>\`; });
+          if(msgs.length === 0) { list.innerHTML = '<div style="text-align:center;color:var(--text-secondary)">还没有留言，做第一个吧！</div>'; }
+        } catch(e) { console.error(e); }
+    
+        document.getElementById('sendBtn').onclick = async () => {
+          const input = document.getElementById('msgInput');
+          const text = input.value.trim();
+          if(!text) return;
+          
+          // 立即显示留言，不等待服务器响应
+          const list = document.getElementById('msgList');
+          const tempMsg = document.createElement('div');
+          tempMsg.className = 'msg-item';
+          tempMsg.innerHTML = \`<div>\${text}</div><div class="msg-time">发送中...</div>\`;
+          list.insertBefore(tempMsg, list.firstChild);
+          
+          // 清空输入框
+          input.value = '';
+          
+          // 在后台发送到服务器
+          try {
+            const res = await fetch('/api/post', { 
+              method: 'POST', 
+              body: JSON.stringify({ text }), 
+              headers: {'Content-Type': 'application/json'} 
+            });
+            
+            if (res.ok) {
+              // 成功后更新状态
+              tempMsg.querySelector('.msg-time').textContent = '已发送';
+            } else {
+              // 失败也保留消息，但标记为发送失败
+              tempMsg.querySelector('.msg-time').textContent = '发送失败 (已保存本地)';
+              tempMsg.style.border = '1px dashed #ff3b30';
+            }
+          } catch (error) {
+            // 网络错误也保留消息
+            tempMsg.querySelector('.msg-time').textContent = '网络错误 (已保存本地)';
+            tempMsg.style.border = '1px dashed #ff3b30';
+          }
+        };
+        
+        document.getElementById('adminClearBtn').onclick = () => {
+            window.showPasswordModal((password) => {
+                this.adminClearMessages(password);
+            });
+        };
+      });
+    },
+    
+    async adminClearMessages(password) {
+        try {
+            const res = await fetch('/api/admin/clear-messages', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password })
+            });
+            const data = await res.json();
+            if (data.success) {
+                alert('留言已清空');
+                this.initTreeHole(); // 刷新列表
+            } else {
+                alert('操作失败: ' + (data.error || '未知错误'));
+            }
+        } catch (e) {
+            alert('网络错误');
+        }
+    },
+
+    async initMap() {
+      document.getElementById('openMapBtn').addEventListener('click', async () => {
+        PanelManager.open("全球访客足迹 🌍", '<div id="map"></div><div class="visitor-list" id="visitorList"><div style="text-align:center;color:var(--text-secondary)">正在定位...</div></div>');
+        const map = L.map('map').setView([35, 105], 2);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '' }).addTo(map);
+        try {
+          const res = await fetch('/api/visit');
+          const data = await res.json(); 
+          L.marker([data.lat, data.lon]).addTo(map).bindPopup(\`来自: \${data.city}, \${data.country}\`).openPopup();
+          document.getElementById('visitorList').innerHTML = \`<div class="visitor-item"><span>当前访客</span><span>\${data.city}, \${data.country}</span></div>\`;
+        } catch(e) { console.error(e); }
+      });
+    }
+  };
+  
+  // ==================== 全局密码弹窗函数 ====================
+  window.showPasswordModal = (callback) => {
+      const modal = document.getElementById('passwordModal');
+      const input = document.getElementById('adminPasswordInput');
+      modal.style.display = 'flex';
+      input.value = '';
+      OtherFeatures.passwordCallback = callback;
+      input.focus();
+  };
+  
+  window.closePasswordModal = () => {
+      const modal = document.getElementById('passwordModal');
+      modal.style.display = 'none';
+      OtherFeatures.passwordCallback = null;
+  };
+  
+  window.submitPassword = () => {
+      const input = document.getElementById('adminPasswordInput');
+      const password = input.value;
+      if (OtherFeatures.passwordCallback) {
+          OtherFeatures.passwordCallback(password);
+      }
+      window.closePasswordModal();
+  };
+  
+  // 监听回车提交密码
+  document.getElementById('adminPasswordInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+          window.submitPassword();
+      }
+  });
+
+  // ==================== 应用初始化 ====================
+  const App = {
+    init() {
+      ClockSystem.init();
+      SiteRenderer.init();
+      SearchEngine.init();
+      TabFilter.init();
+      PanelManager.init();
+      AIAssistant.init();
+      OtherFeatures.init();
+    }
+  };
+  App.init();
+</script>
+</body>
+</html>
+    `;
+
+    return new Response(htmlContent, {
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  },
+};
