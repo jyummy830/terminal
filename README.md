@@ -1,2 +1,1 @@
-# terminal
-a litte webapp
+科研数据站点
